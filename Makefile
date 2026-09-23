@@ -1,99 +1,62 @@
 # Makefile de ldap-scripts
 #
-# Tout est paramétrable en ligne de commande :
-#   make install PREFIX=/opt/ldap-scripts
-#   make install DESTDIR=/tmp/pkg SYSCONFDIR=/etc/ldap-scripts
-#   make install-completion
-#   make check          (vérifie la syntaxe de tous les scripts)
+# L'installation est faite par ./install.sh : ce Makefile n'est qu'une façade
+# pour ceux qui tapent 'make install' par habitude, et pour les outils
+# d'empaquetage qui s'attendent à DESTDIR/PREFIX.
+#
+#   make install
+#   make install SYSCONFDIR=/etc/ldap-scripts
+#   make install DESTDIR=/tmp/pkg PREFIX=/usr
+#   make uninstall
+#   make check
 
-PKGNAME    ?= ldap-scripts
 PREFIX     ?= /usr/local
-SBINDIR    ?= $(PREFIX)/sbin
-LIBDIR     ?= $(PREFIX)/lib/$(PKGNAME)
-SYSCONFDIR ?= $(PREFIX)/etc/$(PKGNAME)
-DOCDIR     ?= $(PREFIX)/share/doc/$(PKGNAME)
-COMPDIR    ?= $(PREFIX)/share/bash-completion/completions
+DESTDIR    ?=
+SBINDIR    ?=
+LIBDIR     ?=
+SYSCONFDIR ?=
+DOCDIR     ?=
+COMPDIR    ?=
 
-INSTALL    ?= install
-SCRIPTS     = ldapadduser ldapdeleteuser ldapsetpasswd ldapfinger lsldap ldapconfig
+INSTALL_SH  = ./install.sh
+OPTS        = --prefix '$(PREFIX)'
+ifneq ($(DESTDIR),)
+OPTS       += --destdir '$(DESTDIR)'
+endif
+ifneq ($(SBINDIR),)
+OPTS       += --sbindir '$(SBINDIR)'
+endif
+ifneq ($(LIBDIR),)
+OPTS       += --libdir '$(LIBDIR)'
+endif
+ifneq ($(SYSCONFDIR),)
+OPTS       += --sysconfdir '$(SYSCONFDIR)'
+endif
+ifneq ($(DOCDIR),)
+OPTS       += --docdir '$(DOCDIR)'
+endif
+ifneq ($(COMPDIR),)
+OPTS       += --compdir '$(COMPDIR)'
+endif
 
-.PHONY: all install install-completion uninstall check help
+.PHONY: all help install uninstall check
 
 all: help
 
 help:
-	@echo "Cibles disponibles :"
-	@echo "  make install              Installe scripts, bibliothèque, config et templates"
-	@echo "  make install-completion   Installe la complétion bash"
-	@echo "  make uninstall            Désinstalle (la configuration est conservée)"
-	@echo "  make check                Vérifie la syntaxe des scripts"
+	@echo "Cibles :"
+	@echo "  make install     Installe (voir aussi ./install.sh --help)"
+	@echo "  make uninstall   Désinstalle, la configuration est conservée"
+	@echo "  make check       Vérifie la syntaxe des scripts"
 	@echo
-	@echo "Variables : PREFIX=$(PREFIX) SBINDIR=$(SBINDIR)"
-	@echo "            LIBDIR=$(LIBDIR) SYSCONFDIR=$(SYSCONFDIR)"
+	@echo "Variables : PREFIX DESTDIR SBINDIR LIBDIR SYSCONFDIR DOCDIR COMPDIR"
+	@echo "Exemple   : make install SYSCONFDIR=/etc/ldap-scripts"
 
 install:
-	$(INSTALL) -d $(DESTDIR)$(SBINDIR) $(DESTDIR)$(LIBDIR) \
-	             $(DESTDIR)$(SYSCONFDIR)/templates $(DESTDIR)$(SYSCONFDIR)/conf.d \
-	             $(DESTDIR)$(DOCDIR)
-	@# Les chemins d'installation sont injectés dans les scripts et la lib,
-	@# ce qui évite toute dépendance à l'arborescence source.
-	@for s in $(SCRIPTS); do \
-		sed -e 's|@LIBDIR@|$(LIBDIR)|g' -e 's|@SYSCONFDIR@|$(SYSCONFDIR)|g' \
-			sbin/$$s > $(DESTDIR)$(SBINDIR)/$$s; \
-		chmod 755 $(DESTDIR)$(SBINDIR)/$$s; \
-		echo "  installé $(SBINDIR)/$$s"; \
-	done
-	@sed -e 's|@LIBDIR@|$(LIBDIR)|g' -e 's|@SYSCONFDIR@|$(SYSCONFDIR)|g' \
-		lib/runtime.sh > $(DESTDIR)$(LIBDIR)/runtime.sh
-	@chmod 644 $(DESTDIR)$(LIBDIR)/runtime.sh
-	$(INSTALL) -m 644 lib/defaults.sh $(DESTDIR)$(LIBDIR)/defaults.sh
-	$(INSTALL) -m 644 etc/templates/*.ldif $(DESTDIR)$(SYSCONFDIR)/templates/
-	$(INSTALL) -m 644 etc/conf.d/README $(DESTDIR)$(SYSCONFDIR)/conf.d/README
-	$(INSTALL) -m 644 README.md CONFIGURATION.md $(DESTDIR)$(DOCDIR)/
-	@# La configuration existante n'est jamais écrasée.
-	@if [ -f $(DESTDIR)$(SYSCONFDIR)/$(PKGNAME).conf ]; then \
-		echo "  conservé $(SYSCONFDIR)/$(PKGNAME).conf (existant)"; \
-		$(INSTALL) -m 644 etc/ldap-scripts.conf $(DESTDIR)$(SYSCONFDIR)/$(PKGNAME).conf.example; \
-	else \
-		$(INSTALL) -m 640 etc/ldap-scripts.conf $(DESTDIR)$(SYSCONFDIR)/$(PKGNAME).conf; \
-		echo "  installé $(SYSCONFDIR)/$(PKGNAME).conf"; \
-	fi
-	@echo
-	@echo "Installation terminée. Étapes suivantes :"
-	@echo "  1. $(SBINDIR)/ldapconfig init      # ou éditer $(SYSCONFDIR)/$(PKGNAME).conf"
-	@echo "  2. $(SBINDIR)/ldapconfig check     # vérifier la configuration"
-
-install-completion:
-	$(INSTALL) -d $(DESTDIR)$(COMPDIR)
-	@# bash-completion charge le fichier portant le nom de la commande tapée :
-	@# il en faut donc un par commande, le premier réel et les autres en liens.
-	@first=""; for s in $(SCRIPTS); do \
-		if [ -z "$$first" ]; then \
-			$(INSTALL) -m 644 share/bash-completion/ldap-scripts $(DESTDIR)$(COMPDIR)/$$s; \
-			first=$$s; \
-		else \
-			ln -sf $$first $(DESTDIR)$(COMPDIR)/$$s; \
-		fi; \
-		echo "  installé $(COMPDIR)/$$s"; \
-	done
+	@$(INSTALL_SH) $(OPTS)
 
 uninstall:
-	@for s in $(SCRIPTS); do rm -f $(DESTDIR)$(SBINDIR)/$$s; done
-	rm -f $(DESTDIR)$(LIBDIR)/runtime.sh $(DESTDIR)$(LIBDIR)/defaults.sh
-	@for s in $(SCRIPTS); do rm -f $(DESTDIR)$(COMPDIR)/$$s; done
-	rm -f $(DESTDIR)$(COMPDIR)/$(PKGNAME)
-	-rmdir $(DESTDIR)$(LIBDIR) 2>/dev/null || true
-	@echo "Désinstallé. $(SYSCONFDIR) a été conservé."
+	@$(INSTALL_SH) $(OPTS) --uninstall
 
 check:
-	@rc=0; \
-	for f in sbin/* lib/*.sh share/bash-completion/*; do \
-		if bash -n "$$f"; then echo "  ok      $$f"; \
-		else echo "  ERREUR  $$f"; rc=1; fi; \
-	done; \
-	if command -v shellcheck >/dev/null 2>&1; then \
-		shellcheck -S warning sbin/* lib/*.sh || rc=1; \
-	else \
-		echo "  (shellcheck absent, analyse statique ignorée)"; \
-	fi; \
-	exit $$rc
+	@$(INSTALL_SH) --check

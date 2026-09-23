@@ -46,28 +46,37 @@ fonctions sont activées. Ce n'est pas un outil client ; le poste sur lequel tu
 édites ces fichiers n'a rien à installer.
 
 ```bash
-make install                      # PREFIX=/usr/local par défaut
-make install SYSCONFDIR=/etc/ldap-scripts    # config dans /etc (usuel sous Debian)
-make install PREFIX=/opt/ldap-scripts
-make install-completion           # complétion bash (facultatif)
+./install.sh                                   # PREFIX=/usr/local par défaut
+./install.sh --sysconfdir /etc/ldap-scripts    # config dans /etc (usuel sous Debian)
+./install.sh --prefix /opt/ldap-scripts
+./install.sh --dry-run                         # voir ce qui serait écrit
+./install.sh --uninstall
+
 ldapconfig init                   # génère la configuration
 ldapconfig check                  # vérifie qu'elle est utilisable
 ```
 
+La complétion bash est installée par défaut (`--no-completion` pour s'en
+passer), et `./install.sh --check` vérifie la syntaxe des scripts. Un
+`Makefile` est fourni pour ceux qui tapent `make install` par habitude : il ne
+fait que déléguer à `install.sh`, avec les variables `PREFIX`, `DESTDIR`,
+`SYSCONFDIR` habituelles.
+
 Les fichiers atterrissent dans `<PREFIX>/sbin`, `<PREFIX>/lib/ldap-scripts` et
-`<SYSCONFDIR>` (par défaut `<PREFIX>/etc/ldap-scripts`). `make install`
+`<SYSCONFDIR>` (par défaut `<PREFIX>/etc/ldap-scripts`). L'installation
 n'écrase jamais une configuration existante et injecte les chemins réels dans
 les scripts, qui n'ont donc besoin d'aucune variable d'environnement pour
-fonctionner.
+fonctionner. Changer `--sysconfdir` après coup impose donc de relancer
+l'installation, pas seulement de déplacer le fichier.
 
-Prérequis : `bash` 4.1+, `make`, les clients OpenLDAP (`ldapsearch`, `ldapadd`,
-…) et, selon la configuration, `slappasswd` et `kadmin.local`.
+Prérequis : `bash` 4.1+, les clients OpenLDAP (`ldapsearch`, `ldapadd`, …) et,
+selon la configuration, `slappasswd` et `kadmin.local`. Ni `make` ni aucun
+outil de compilation ne sont nécessaires.
 
-Sans `make`, l'installation se résume à copier `sbin/`, `lib/` et `etc/` où tu
-veux : les scripts retrouvent la bibliothèque relativement à leur propre
+Les scripts fonctionnent aussi directement depuis l'arborescence source, sans
+installation : ils retrouvent la bibliothèque relativement à leur propre
 emplacement (`../lib/`), et `LDAP_SCRIPTS_CONF` désigne la configuration.
-Ils fonctionnent aussi directement depuis l'arborescence source, sans
-installation, ce qui est pratique pour tester.
+Pratique pour tester en `--dry-run` avant d'installer quoi que ce soit.
 
 ## Configuration
 
