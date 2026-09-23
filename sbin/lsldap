@@ -1,0 +1,203 @@
+#!/bin/bash
+# lsldap - Liste les comptes de l'annuaire avec un contrôle de cohérence.
+
+set -euo pipefail
+
+# --- Localisation de la bibliothèque partagée ------------------------------
+: "${LDAP_SCRIPTS_LIB:=@LIBDIR@}"
+case "$LDAP_SCRIPTS_LIB" in @*@) LDAP_SCRIPTS_LIB="" ;; esac
+if [ -z "$LDAP_SCRIPTS_LIB" ] || [ ! -f "$LDAP_SCRIPTS_LIB/runtime.sh" ]; then
+    _self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+    LDAP_SCRIPTS_LIB="$(cd "$(dirname "$_self")/../lib" && pwd)"
+fi
+[ -f "$LDAP_SCRIPTS_LIB/runtime.sh" ] || {
+    echo "ldap-scripts: runtime.sh introuvable, définis LDAP_SCRIPTS_LIB" >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$LDAP_SCRIPTS_LIB/runtime.sh"
+
+usage() {
+    cat <<'USAGE'
+lsldap - Liste les comptes de l'annuaire
+
+Usage :
+  lsldap [options] [motif]
+
+Description :
+  Affiche les comptes POSIX de l'annuaire. Le motif accepte les jokers LDAP
+  (ex: "jd*"). Sans option, chaque ligne indique si le principal Kerberos et
+  le répertoire personnel correspondants existent bien.
+
+Options spécifiques :
+  -g, --groups           Liste les groupes au lieu des comptes
+  -l, --long             Ajoute nom complet, shell et répertoire
+  -s, --short            N'affiche que les logins (pratique pour scripter)
+      --sort CLÉ         Tri : login (défaut) ou uid
+      --filter FILTRE    Filtre LDAP complet, remplace le motif
+      --no-check         N'effectue aucun contrôle de cohérence (plus rapide)
+      --problems         N'affiche que les comptes incohérents
+
+Exemples :
+  lsldap
+  lsldap "jd*"
+  lsldap --long --sort uid
+  lsldap --short | wc -l
+  lsldap --problems
+
+USAGE
+    common_options_help
+}
+
+handle_extra_arg() {
+    case "$1" in
+        -g|--groups)  CLI_OVERRIDES+=("LIST_GROUPS=1"); EXTRA_SHIFT=1 ;;
+        -l|--long)    CLI_OVERRIDES+=("LIST_FORMAT=long"); EXTRA_SHIFT=1 ;;
+        -s|--short)   CLI_OVERRIDES+=("LIST_FORMAT=short"); EXTRA_SHIFT=1 ;;
+        --sort)       CLI_OVERRIDES+=("LIST_SORT=$2"); EXTRA_SHIFT=2 ;;
+        --filter)     CLI_OVERRIDES+=("LIST_FILTER=$2"); EXTRA_SHIFT=2 ;;
+        --no-check)   CLI_OVERRIDES+=("LIST_CHECK=0"); EXTRA_SHIFT=1 ;;
+        --problems)   CLI_OVERRIDES+=("LIST_ONLY_PROBLEMS=1" "LIST_CHECK=1"); EXTRA_SHIFT=1 ;;
+    esac
+}
+
+ldap_scripts_init "$@"
+set -- "${ARGS[@]:-}"
+
+# ARGS vide donne un premier argument vide : on retombe sur le joker.
+PATTERN="${1:-}"
+[ -n "$PATTERN" ] || PATTERN="*"
+FORMAT="${LIST_FORMAT:-normal}"
+CHECK="${LIST_CHECK:-1}"
+ONLY_PROBLEMS="${LIST_ONLY_PROBLEMS:-0}"
+[ "$ONLY_PROBLEMS" = "1" ] && FORMAT="normal"
+
+# ---------------------------------------------------------------------------
+# Liste des groupes
+# ---------------------------------------------------------------------------
+if [ "${LIST_GROUPS:-0}" = "1" ]; then
+    FILTER="${LIST_FILTER:-(&${GROUP_FILTER}(${GROUP_ATTR}=${PATTERN}))}"
+    rows=$(ldap_run ldapsearch -LLL -b "$GROUPS_DN" "$FILTER" \
+        "$GROUP_ATTR" gidNumber "$GROUP_MEMBER_ATTR" 2>/dev/null \
+        | awk -v ga="${GROUP_ATTR}:" -v ma="${GROUP_MEMBER_ATTR}:" '
+            $1 == "dn:" { if (name != "") print name, gid, members; name=""; gid="-"; members=0 }
+            $1 == ga    { name=$2 }
+            $1 == "gidNumber:" { gid=$2 }
+            $1 == ma    { members++ }
+            END { if (name != "") print name, gid, members }')
+    if [ -z "$rows" ]; then
+        echo "Aucun groupe ne correspond à '${PATTERN}' dans ${GROUPS_DN}."
+        exit 0
+    fi
+    if [ "$FORMAT" = "short" ]; then
+        echo "$rows" | awk '{print $1}' | sort
+        exit 0
+    fi
+    printf '%s%-24s %-10s %s%s\n' "$C_BLUE" "GROUPE" "GID" "MEMBRES" "$C_RESET"
+    echo "$rows" | sort | while read -r name gid members; do
+        printf '%-24s %-10s %s\n' "$name" "$gid" "$members"
+    done
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Liste des comptes
+# ---------------------------------------------------------------------------
+FILTER="${LIST_FILTER:-(&${USER_FILTER}(${UID_ATTR}=${PATTERN}))}"
+
+rows=$(ldap_run ldapsearch -LLL -b "$USERS_DN" "$FILTER" \
+    "$UID_ATTR" uidNumber gidNumber cn loginShell homeDirectory 2>/dev/null \
+    | awk -v ua="${UID_ATTR}:" '
+        function flush() {
+            if (u != "") printf "%s\t%s\t%s\t%s\t%s\t%s\n", u, uidn, gidn, cn, shell, home
+        }
+        $1 == "dn:" { flush(); u=""; uidn="-"; gidn="-"; cn="-"; shell="-"; home="-" }
+        $1 == ua    { u=$2 }
+        $1 == "uidNumber:" { uidn=$2 }
+        $1 == "gidNumber:" { gidn=$2 }
+        $1 == "cn:" { $1=""; sub(/^[ \t]+/, ""); cn=$0 }
+        $1 == "loginShell:" { shell=$2 }
+        $1 == "homeDirectory:" { home=$2 }
+        END { flush() }')
+
+if [ -z "$rows" ]; then
+    echo "Aucun compte ne correspond à '${PATTERN}' dans ${USERS_DN}."
+    exit 0
+fi
+
+case "${LIST_SORT:-login}" in
+    uid)   rows=$(echo "$rows" | sort -t $'\t' -k2 -n) ;;
+    *)     rows=$(echo "$rows" | sort -t $'\t' -k1) ;;
+esac
+
+if [ "$FORMAT" = "short" ]; then
+    echo "$rows" | cut -f1
+    exit 0
+fi
+
+total=0
+warnings=0
+
+if [ "$FORMAT" = "long" ]; then
+    printf '%s%-16s %-7s %-7s %-22s %-14s %s%s\n' "$C_BLUE" \
+        "LOGIN" "UID" "GID" "NOM" "SHELL" "RÉPERTOIRE" "$C_RESET"
+else
+    header_krb5=""
+    header_home=""
+    if [ "$CHECK" = "1" ]; then
+        krb5_enabled && header_krb5="KERBEROS"
+        home_enabled && header_home="RÉPERTOIRE"
+    fi
+    printf '%s%-16s %-7s %-7s %-22s %-10s %s%s\n' "$C_BLUE" \
+        "LOGIN" "UID" "GID" "NOM" "$header_krb5" "$header_home" "$C_RESET"
+fi
+
+while IFS=$'\t' read -r USERNAME uidn gidn cn shell home; do
+    [ -n "$USERNAME" ] || continue
+    total=$((total + 1))
+
+    if [ "$FORMAT" = "long" ]; then
+        printf '%-16s %-7s %-7s %s %-14s %s\n' \
+            "$USERNAME" "$uidn" "$gidn" "$(pad "$cn" 22)" "$shell" "$home"
+        continue
+    fi
+
+    krb5_state=""
+    home_state=""
+    problem=0
+    if [ "$CHECK" = "1" ]; then
+        if krb5_enabled; then
+            if kerberos_principal_exists "$USERNAME"; then
+                krb5_state="ok"
+            else
+                krb5_state="MANQUANT"; problem=1
+            fi
+        fi
+        if home_enabled; then
+            if [ -d "$(home_physical)" ]; then
+                home_state="ok"
+            else
+                home_state="MANQUANT"; problem=1
+            fi
+        fi
+    fi
+
+    [ "$problem" = "1" ] && warnings=$((warnings + 1))
+    if [ "$ONLY_PROBLEMS" = "1" ] && [ "$problem" = "0" ]; then
+        continue
+    fi
+
+    color=""
+    [ "$problem" = "1" ] && color="$C_YELLOW"
+    printf '%s%-16s %-7s %-7s %s %-10s %s%s\n' \
+        "$color" "$USERNAME" "$uidn" "$gidn" "$(pad "$cn" 22)" \
+        "$krb5_state" "$home_state" "$C_RESET"
+done <<< "$rows"
+
+if [ "${QUIET:-0}" != "1" ]; then
+    echo
+    if [ "$CHECK" = "1" ] && [ "$warnings" -gt 0 ]; then
+        printf '%s compte(s), %s%s à vérifier%s (détail : ldapfinger <login>)\n' \
+            "$total" "$C_YELLOW" "$warnings" "$C_RESET"
+    else
+        printf '%s compte(s)\n' "$total"
+    fi
+fi

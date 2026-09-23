@@ -1,0 +1,26 @@
+# Template de l'entrée utilisateur.
+#
+# Toute variable de configuration est utilisable ici sous la forme {{NOM}}
+# (la syntaxe historique <NOM> reste acceptée). Une ligne dont la valeur est
+# vide après substitution est automatiquement supprimée : tu peux donc
+# ajouter des attributs optionnels sans rien casser.
+#
+# Variables calculées disponibles :
+#   USERNAME FIRSTNAME LASTNAME CN MAIL UID_NUMBER GID_NUMBER
+#   HOME_DIRECTORY LOGIN_SHELL USER_DN GROUP_DN GROUP_NAME
+#   USER_PASSWORD_VALUE USER_EXTRA_LDIF KRB5_REALM MAIL_DOMAIN
+dn: {{USER_DN}}
+objectClass: inetOrgPerson
+objectClass: posixAccount
+objectClass: shadowAccount
+{{USER_EXTRA_LDIF}}
+{{UID_ATTR}}: {{USERNAME}}
+cn: {{CN}}
+sn: {{LASTNAME}}
+givenName: {{FIRSTNAME}}
+mail: {{MAIL}}
+uidNumber: {{UID_NUMBER}}
+gidNumber: {{GID_NUMBER}}
+homeDirectory: {{HOME_DIRECTORY}}
+loginShell: {{LOGIN_SHELL}}
+userPassword: {{USER_PASSWORD_VALUE}}

@@ -1,0 +1,7 @@
+# Template du groupe POSIX (utilisé par GROUP_MODE=per-user et pour la
+# création automatique du groupe partagé en GROUP_MODE=shared).
+dn: {{GROUP_DN}}
+objectClass: posixGroup
+{{GROUP_ATTR}}: {{GROUP_NAME}}
+gidNumber: {{GID_NUMBER}}
+{{GROUP_MEMBER_LDIF}}

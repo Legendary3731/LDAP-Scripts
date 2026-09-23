@@ -1,0 +1,69 @@
+# Complétion bash pour ldap-scripts.
+# Installée par 'make install' dans <PREFIX>/share/bash-completion/completions/,
+# ou à sourcer manuellement :  source share/bash-completion/ldap-scripts
+
+_ldap_scripts_common_opts='--config -o --uri --base-dn --bind-dn --bind-password
+    --bind-password-file --sasl --no-kerberos --no-home --dry-run --yes --quiet
+    --verbose --version --help'
+
+# Noms de paramètres, pour compléter -o NOM=
+_ldap_scripts_params() {
+    local lib
+    for lib in "${LDAP_SCRIPTS_LIB:-}" /usr/local/lib/ldap-scripts /usr/lib/ldap-scripts; do
+        if [ -f "$lib/defaults.sh" ]; then
+            grep -oE '^[A-Z_][A-Z0-9_]*=' "$lib/defaults.sh" | tr -d '=' | sed 's/$/=/'
+            return
+        fi
+    done
+}
+
+# Logins existants, sans interroger l'annuaire si le cache NSS suffit
+_ldap_scripts_users() {
+    getent passwd 2>/dev/null | cut -d: -f1
+}
+
+_ldap_scripts() {
+    local cur prev cmd
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    cmd="${COMP_WORDS[0]##*/}"
+
+    case "$prev" in
+        --config|--bind-password-file)
+            COMPREPLY=($(compgen -f -- "$cur")); return ;;
+        -o)
+            COMPREPLY=($(compgen -W "$(_ldap_scripts_params)" -- "$cur")); return ;;
+        --shell)
+            COMPREPLY=($(compgen -W "$(cat /etc/shells 2>/dev/null)" -- "$cur")); return ;;
+        --sasl)
+            COMPREPLY=($(compgen -W "EXTERNAL GSSAPI DIGEST-MD5" -- "$cur")); return ;;
+    esac
+
+    local specific=''
+    case "$cmd" in
+        ldapadduser)    specific='--uid --gid --group --shell --home --mail --cn
+                                 --password --random-password --show-ldif' ;;
+        ldapdeleteuser) specific='--archive-home --purge-home --keep-home --keep-kerberos' ;;
+        ldapsetpasswd)  specific='--password --random --kerberos-only --ldap-only' ;;
+        ldapfinger)     specific='--ldif --attrs --all-attrs' ;;
+        lsldap)         specific='--groups --long --short --sort --filter --no-check --problems' ;;
+        ldapconfig)
+            if [ "$COMP_CWORD" -eq 1 ]; then
+                COMPREPLY=($(compgen -W "show check init files params edit" -- "$cur"))
+                return
+            fi
+            ;;
+    esac
+
+    if [[ "$cur" == -* ]]; then
+        COMPREPLY=($(compgen -W "$_ldap_scripts_common_opts $specific" -- "$cur"))
+        return
+    fi
+
+    case "$cmd" in
+        ldapdeleteuser|ldapsetpasswd|ldapfinger)
+            COMPREPLY=($(compgen -W "$(_ldap_scripts_users)" -- "$cur")) ;;
+    esac
+}
+
+complete -F _ldap_scripts ldapadduser ldapdeleteuser ldapsetpasswd ldapfinger lsldap ldapconfig

@@ -1,0 +1,277 @@
+#!/bin/bash
+# ldapadduser - Crée un compte complet : entrée LDAP, groupe POSIX,
+#               principal Kerberos (si activé) et répertoire personnel.
+
+set -euo pipefail
+
+# --- Localisation de la bibliothèque partagée ------------------------------
+: "${LDAP_SCRIPTS_LIB:=@LIBDIR@}"
+case "$LDAP_SCRIPTS_LIB" in @*@) LDAP_SCRIPTS_LIB="" ;; esac
+if [ -z "$LDAP_SCRIPTS_LIB" ] || [ ! -f "$LDAP_SCRIPTS_LIB/runtime.sh" ]; then
+    _self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+    LDAP_SCRIPTS_LIB="$(cd "$(dirname "$_self")/../lib" && pwd)"
+fi
+[ -f "$LDAP_SCRIPTS_LIB/runtime.sh" ] || {
+    echo "ldap-scripts: runtime.sh introuvable, définis LDAP_SCRIPTS_LIB" >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$LDAP_SCRIPTS_LIB/runtime.sh"
+
+usage() {
+    cat <<'USAGE'
+ldapadduser - Crée un compte utilisateur complet
+
+Usage :
+  ldapadduser [options] <login> [prénom] [nom]
+
+Description :
+  Crée, dans cet ordre : l'entrée LDAP, le groupe POSIX associé, le principal
+  Kerberos (si KRB5_ENABLED=1) puis le répertoire personnel. Si une étape
+  échoue, les étapes déjà effectuées sont annulées quand c'est possible.
+  L'UID est attribué automatiquement dans la plage UID_MIN..UID_MAX.
+
+Options spécifiques :
+      --uid NUMÉRO       Force l'uidNumber au lieu de le calculer
+      --gid NUMÉRO       Force le gidNumber
+      --group NOM        Groupe primaire à utiliser (implique GROUP_MODE=shared)
+      --shell CHEMIN     Shell de connexion
+      --home CHEMIN      Chemin complet du répertoire personnel
+      --mail ADRESSE     Adresse mail explicite
+      --cn "NOM COMPLET" Valeur de cn si elle ne suit pas CN_PATTERN
+      --password MDP     Mot de passe initial (mode hash ; sinon demandé)
+      --random-password  Génère un mot de passe et l'affiche
+      --show-ldif        Affiche le LDIF généré avant de l'appliquer
+
+Exemples :
+  ldapadduser jdupont Jean Dupont
+  ldapadduser --dry-run --show-ldif jdupont Jean Dupont
+  ldapadduser --group profs --shell /bin/zsh mmartin Marie Martin
+  ldapadduser -o HOME_ROOT=/srv/nfs/home -o UID_MIN=20000 stagiaire Alex Stagiaire
+
+USAGE
+    common_options_help
+}
+
+handle_extra_arg() {
+    case "$1" in
+        --uid)             CLI_OVERRIDES+=("FORCE_UID=$2"); EXTRA_SHIFT=2 ;;
+        --gid)             CLI_OVERRIDES+=("FORCE_GID=$2"); EXTRA_SHIFT=2 ;;
+        --group)           CLI_OVERRIDES+=("GROUP_MODE=shared" "DEFAULT_GROUP=$2"); EXTRA_SHIFT=2 ;;
+        --shell)           CLI_OVERRIDES+=("DEFAULT_SHELL=$2"); EXTRA_SHIFT=2 ;;
+        --home)            CLI_OVERRIDES+=("FORCE_HOME=$2"); EXTRA_SHIFT=2 ;;
+        --mail)            CLI_OVERRIDES+=("FORCE_MAIL=$2"); EXTRA_SHIFT=2 ;;
+        --cn)              CLI_OVERRIDES+=("FORCE_CN=$2"); EXTRA_SHIFT=2 ;;
+        --password)        CLI_OVERRIDES+=("FORCE_USER_PASSWORD=$2"); EXTRA_SHIFT=2 ;;
+        --random-password) CLI_OVERRIDES+=("USER_PASSWORD_INITIAL=random"); EXTRA_SHIFT=1 ;;
+        --show-ldif)       CLI_OVERRIDES+=("SHOW_LDIF=1"); EXTRA_SHIFT=1 ;;
+    esac
+}
+
+ldap_scripts_init "$@"
+set -- "${ARGS[@]:-}"
+
+[ $# -ge 1 ] && [ -n "${1:-}" ] || { usage; exit 1; }
+require_root
+
+USERNAME="$1"
+FIRSTNAME="${2:-$1}"
+LASTNAME="${3:-$1}"
+LS_ACTION="add"
+
+validate_username "$USERNAME"
+
+if [ "$USER_PASSWORD_MODE" = "sasl" ] && ! krb5_enabled; then
+    warn "USER_PASSWORD_MODE=sasl sans Kerberos : le compte n'aura aucun mot de passe utilisable."
+    info "Utilise USER_PASSWORD_MODE=hash, ou active Kerberos (KRB5_ENABLED=1)."
+fi
+
+# --- Valeurs dérivées ------------------------------------------------------
+CN="${FORCE_CN:-$(expand_pattern "$CN_PATTERN")}"
+if [ -n "${FORCE_MAIL:-}" ]; then
+    MAIL="$FORCE_MAIL"
+elif [ -n "$MAIL_PATTERN" ]; then
+    MAIL="$(expand_pattern "$MAIL_PATTERN")"
+else
+    MAIL=""
+fi
+LOGIN_SHELL="$DEFAULT_SHELL"
+USER_DN="$(ldap_user_dn "$USERNAME")"
+
+log "Vérification de l'annuaire"
+ldap_check_connection || die "connexion LDAP impossible sur ${LDAP_URI} (teste avec 'ldapconfig check')"
+ldap_user_exists "$USERNAME" && die "le compte '${USERNAME}' existe déjà dans l'annuaire"
+if krb5_enabled && kerberos_principal_exists "$USERNAME"; then
+    die "le principal Kerberos '${USERNAME}@${KRB5_REALM}' existe déjà"
+fi
+
+# --- UID / GID -------------------------------------------------------------
+UID_NUMBER="${FORCE_UID:-$(next_uid)}"
+case "$GROUP_MODE" in
+    per-user)
+        GROUP_NAME="$USERNAME"
+        GID_NUMBER="${FORCE_GID:-$UID_NUMBER}"
+        ;;
+    shared)
+        GROUP_NAME="$DEFAULT_GROUP"
+        GID_NUMBER="${FORCE_GID:-$(ldap_group_gid "$GROUP_NAME")}"
+        if [ -z "$GID_NUMBER" ]; then
+            [ "$GROUP_AUTOCREATE" = "1" ] || die "le groupe '${GROUP_NAME}' n'existe pas (GROUP_AUTOCREATE=0)"
+            GID_NUMBER="${DEFAULT_GID:-$UID_NUMBER}"
+        fi
+        ;;
+    none)
+        GROUP_NAME=""
+        GID_NUMBER="${FORCE_GID:-$DEFAULT_GID}"
+        ;;
+esac
+GROUP_DN=""
+[ -n "$GROUP_NAME" ] && GROUP_DN="$(ldap_group_dn "$GROUP_NAME")"
+
+# --- Répertoire personnel --------------------------------------------------
+if [ -n "${FORCE_HOME:-}" ]; then
+    HOME_PHYSICAL="$FORCE_HOME"
+    HOME_DIRECTORY="$FORCE_HOME"
+else
+    HOME_PHYSICAL="$(home_physical)"
+    HOME_DIRECTORY="$(home_logical)"
+fi
+
+# --- Mot de passe stocké dans l'annuaire -----------------------------------
+USER_PASSWORD_VALUE=""
+GENERATED_PASSWORD=""
+case "$USER_PASSWORD_MODE" in
+    sasl)
+        USER_PASSWORD_VALUE="{SASL}${USERNAME}@${KRB5_REALM}"
+        ;;
+    hash)
+        local_pw="${FORCE_USER_PASSWORD:-}"
+        if [ -z "$local_pw" ]; then
+            if [ "$USER_PASSWORD_INITIAL" = "random" ]; then
+                local_pw="$(random_password "$USER_PASSWORD_RANDOM_LENGTH")"
+                GENERATED_PASSWORD="$local_pw"
+            else
+                read -rsp "Mot de passe initial de ${USERNAME} : " local_pw; echo
+                read -rsp "Confirmation : " pw2; echo
+                [ "$local_pw" = "$pw2" ] || die "les deux saisies diffèrent"
+                unset pw2
+            fi
+        fi
+        USER_PASSWORD_VALUE="$("$SLAPPASSWD_CMD" -h "$USER_PASSWORD_HASH" -s "$local_pw")" \
+            || die "échec de ${SLAPPASSWD_CMD}"
+        unset local_pw
+        ;;
+esac
+
+# --- Génération du LDIF ----------------------------------------------------
+USER_EXTRA_LDIF="$(render_extra_attrs)"
+GROUP_MEMBER_LDIF=""
+[ "$GROUP_MODE" = "shared" ] && [ "$GROUP_ADD_MEMBER" = "1" ] && \
+    GROUP_MEMBER_LDIF="${GROUP_MEMBER_ATTR}: ${USERNAME}"
+
+LDIF=""
+create_group=0
+if [ -n "$GROUP_NAME" ]; then
+    if [ "$GROUP_MODE" = "per-user" ]; then
+        create_group=1
+    elif ! ldap_group_exists "$GROUP_NAME" && [ "$GROUP_AUTOCREATE" = "1" ]; then
+        create_group=1
+    fi
+fi
+[ "$create_group" = "1" ] && LDIF+="$(render_template "$TEMPLATE_GROUP")"$'\n\n'
+LDIF+="$(render_template "$TEMPLATE_USER")"$'\n'
+
+# --- Récapitulatif ---------------------------------------------------------
+section "Compte à créer"
+kv "Login"        "$USERNAME"
+kv "Nom complet"  "$CN"
+kv "DN"           "$USER_DN"
+kv "UID / GID"    "${UID_NUMBER} / ${GID_NUMBER}"
+[ -n "$GROUP_NAME" ] && kv "Groupe primaire" "${GROUP_NAME}$([ "$create_group" = 1 ] && echo ' (à créer)')"
+[ -n "$MAIL" ] && kv "Mail" "$MAIL"
+kv "Shell"        "$LOGIN_SHELL"
+home_enabled && kv "Répertoire" "$HOME_PHYSICAL$([ "$HOME_PHYSICAL" != "$HOME_DIRECTORY" ] && echo " (vu comme ${HOME_DIRECTORY})")"
+krb5_enabled && kv "Kerberos" "${USERNAME}@${KRB5_REALM}"
+
+# En simulation, le LDIF est toujours montré : c'est l'intérêt de la simulation.
+[ "${DRY_RUN:-0}" = "1" ] && SHOW_LDIF="${SHOW_LDIF:-1}"
+if [ "${SHOW_LDIF:-0}" = "1" ]; then
+    section "LDIF généré"
+    printf '%s' "$LDIF" | sed 's/^/  /'
+fi
+
+confirm $'\nCréer ce compte ?' || { echo "Annulé."; exit 0; }
+
+run_hook HOOK_PRE_ADD
+
+# --- Écriture dans l'annuaire ----------------------------------------------
+section "Création"
+LDIF_FILE=$(mktemp_tracked)
+printf '%s' "$LDIF" > "$LDIF_FILE"
+if [ "${DRY_RUN:-0}" = "1" ]; then
+    echo "${C_YELLOW}[dry-run]${C_RESET} ldapadd -f <ldif ci-dessus>"
+else
+    ldap_run ldapadd -f "$LDIF_FILE" >/dev/null || die "échec de l'ajout LDAP, rien n'a été créé"
+    ok "entrée LDAP créée"
+fi
+
+rollback_ldap() {
+    warn "annulation : suppression de l'entrée LDAP créée"
+    ldap_run ldapdelete "$USER_DN" >/dev/null 2>&1 || true
+    [ "$create_group" = "1" ] && ldap_run ldapdelete "$GROUP_DN" >/dev/null 2>&1 || true
+}
+
+# Ajout au groupe partagé existant.
+if [ "$GROUP_MODE" = "shared" ] && [ "$create_group" = "0" ] && [ "$GROUP_ADD_MEMBER" = "1" ]; then
+    MODIFY_FILE=$(mktemp_tracked)
+    cat > "$MODIFY_FILE" <<EOF
+dn: ${GROUP_DN}
+changetype: modify
+add: ${GROUP_MEMBER_ATTR}
+${GROUP_MEMBER_ATTR}: ${USERNAME}
+EOF
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        echo "${C_YELLOW}[dry-run]${C_RESET} ajout de ${USERNAME} dans ${GROUP_DN}"
+    else
+        ldap_run ldapmodify -f "$MODIFY_FILE" >/dev/null 2>&1 \
+            && ok "ajouté au groupe ${GROUP_NAME}" \
+            || warn "impossible d'ajouter ${USERNAME} à ${GROUP_NAME}"
+    fi
+fi
+
+# --- Kerberos --------------------------------------------------------------
+if krb5_enabled; then
+    if kerberos_create_principal "$USERNAME"; then
+        ok "principal Kerberos ${USERNAME}@${KRB5_REALM} créé"
+    elif [ "$KRB5_REQUIRED" = "1" ]; then
+        rollback_ldap
+        die "création du principal Kerberos impossible (KRB5_REQUIRED=1)"
+    else
+        warn "principal Kerberos non créé après ${KRB5_MAX_RETRIES} tentatives."
+        info "Le compte existe dans l'annuaire mais ne pourra pas s'authentifier."
+        info "Corrige avec : ${KRB5_ADMIN_CMD} -q \"addprinc ${USERNAME}\""
+    fi
+fi
+
+# --- Répertoire personnel --------------------------------------------------
+if home_enabled; then
+    if [ -d "$HOME_PHYSICAL" ]; then
+        warn "${HOME_PHYSICAL} existe déjà, contenu conservé"
+    fi
+    home_create "$HOME_PHYSICAL" "$UID_NUMBER" "$GID_NUMBER"
+    ok "répertoire ${HOME_PHYSICAL} prêt"
+fi
+
+flush_cache
+run_hook HOOK_POST_ADD
+
+# --- Bilan -----------------------------------------------------------------
+section "Terminé"
+kv "Compte" "${USERNAME} (uid ${UID_NUMBER})"
+[ -n "$GENERATED_PASSWORD" ] && kv "Mot de passe" "$GENERATED_PASSWORD"
+if [ "${NSS_CHECK:-0}" = "1" ] && [ "${DRY_RUN:-0}" != "1" ]; then
+    if getent passwd "$USERNAME" >/dev/null 2>&1; then
+        status ok "résolution NSS fonctionnelle"
+    else
+        status warn "pas encore résolu par NSS (cache SSSD/nscd, ou machine non cliente)"
+    fi
+fi
+info "Détail du compte : ldapfinger ${USERNAME}"

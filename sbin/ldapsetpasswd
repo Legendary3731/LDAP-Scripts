@@ -1,0 +1,158 @@
+#!/bin/bash
+# ldapsetpasswd - Change le mot de passe d'un compte, côté Kerberos et/ou
+#                 côté annuaire selon USER_PASSWORD_MODE.
+
+set -euo pipefail
+
+# --- Localisation de la bibliothèque partagée ------------------------------
+: "${LDAP_SCRIPTS_LIB:=@LIBDIR@}"
+case "$LDAP_SCRIPTS_LIB" in @*@) LDAP_SCRIPTS_LIB="" ;; esac
+if [ -z "$LDAP_SCRIPTS_LIB" ] || [ ! -f "$LDAP_SCRIPTS_LIB/runtime.sh" ]; then
+    _self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+    LDAP_SCRIPTS_LIB="$(cd "$(dirname "$_self")/../lib" && pwd)"
+fi
+[ -f "$LDAP_SCRIPTS_LIB/runtime.sh" ] || {
+    echo "ldap-scripts: runtime.sh introuvable, définis LDAP_SCRIPTS_LIB" >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$LDAP_SCRIPTS_LIB/runtime.sh"
+
+usage() {
+    cat <<'USAGE'
+ldapsetpasswd - Réinitialise le mot de passe d'un compte
+
+Usage :
+  ldapsetpasswd [options] <login>
+
+Description :
+  Agit là où le mot de passe est réellement stocké :
+    - USER_PASSWORD_MODE=sasl : uniquement le principal Kerberos
+      (l'attribut userPassword ne contient qu'une délégation {SASL}).
+    - USER_PASSWORD_MODE=hash : uniquement l'annuaire, via ldappasswd.
+  Si Kerberos est activé en plus d'un mot de passe haché, les deux sont
+  mis à jour avec la même valeur.
+
+Options spécifiques :
+      --password MDP     Nouveau mot de passe (déconseillé : visible dans ps)
+      --random           Génère un mot de passe et l'affiche
+      --kerberos-only    Ne touche qu'au principal Kerberos
+      --ldap-only        Ne touche qu'à l'annuaire
+
+Exemples :
+  ldapsetpasswd jdupont
+  ldapsetpasswd --random jdupont
+  ldapsetpasswd --ldap-only -o USER_PASSWORD_MODE=hash jdupont
+
+USAGE
+    common_options_help
+}
+
+handle_extra_arg() {
+    case "$1" in
+        --password)      CLI_OVERRIDES+=("FORCE_USER_PASSWORD=$2"); EXTRA_SHIFT=2 ;;
+        --random)        CLI_OVERRIDES+=("USER_PASSWORD_INITIAL=random"); EXTRA_SHIFT=1 ;;
+        --kerberos-only) CLI_OVERRIDES+=("TARGET=kerberos"); EXTRA_SHIFT=1 ;;
+        --ldap-only)     CLI_OVERRIDES+=("TARGET=ldap"); EXTRA_SHIFT=1 ;;
+    esac
+}
+
+ldap_scripts_init "$@"
+set -- "${ARGS[@]:-}"
+
+[ $# -ge 1 ] && [ -n "${1:-}" ] || { usage; exit 1; }
+
+USERNAME="$1"
+LS_ACTION="passwd"
+USER_DN="$(ldap_user_dn "$USERNAME")"
+
+# Que faut-il mettre à jour ?
+do_krb5=0
+do_ldap=0
+case "${TARGET:-auto}" in
+    kerberos) do_krb5=1 ;;
+    ldap)     do_ldap=1 ;;
+    *)
+        krb5_enabled && do_krb5=1
+        [ "$USER_PASSWORD_MODE" = "hash" ] && do_ldap=1
+        ;;
+esac
+[ "$do_krb5" = "1" ] || [ "$do_ldap" = "1" ] || \
+    die "rien à faire : ni Kerberos ni mot de passe LDAP ne sont actifs (USER_PASSWORD_MODE=${USER_PASSWORD_MODE})"
+
+[ "$do_krb5" = "1" ] && require_root
+
+section "Compte"
+kv "Login" "$USERNAME"
+[ "$do_krb5" = "1" ] && kv "Kerberos" "${USERNAME}@${KRB5_REALM}"
+[ "$do_ldap" = "1" ] && kv "Annuaire" "$USER_DN"
+
+# --- Vérifications ---------------------------------------------------------
+if [ "$do_ldap" = "1" ]; then
+    ldap_user_exists "$USERNAME" || die "le compte '${USERNAME}' n'existe pas dans l'annuaire"
+fi
+if [ "$do_krb5" = "1" ] && [ "${DRY_RUN:-0}" != "1" ]; then
+    kerberos_principal_exists "$USERNAME" || \
+        die "aucun principal Kerberos '${USERNAME}@${KRB5_REALM}'"
+fi
+
+# --- Nouveau mot de passe --------------------------------------------------
+NEW_PASSWORD="${FORCE_USER_PASSWORD:-}"
+GENERATED=0
+if [ -z "$NEW_PASSWORD" ] && [ "$USER_PASSWORD_INITIAL" = "random" ]; then
+    NEW_PASSWORD="$(random_password "$USER_PASSWORD_RANDOM_LENGTH")"
+    GENERATED=1
+fi
+
+# Si seul Kerberos est concerné et qu'aucun mot de passe n'est fourni, on
+# laisse kadmin mener le dialogue (double saisie, politique de qualité).
+interactive_krb5=0
+if [ -z "$NEW_PASSWORD" ]; then
+    if [ "$do_ldap" = "1" ]; then
+        read -rsp "Nouveau mot de passe pour ${USERNAME} : " NEW_PASSWORD; echo
+        read -rsp "Confirmation : " pw2; echo
+        [ "$NEW_PASSWORD" = "$pw2" ] || die "les deux saisies diffèrent"
+        unset pw2
+    else
+        interactive_krb5=1
+    fi
+fi
+
+section "Mise à jour"
+
+if [ "$do_krb5" = "1" ]; then
+    if [ "$interactive_krb5" = "1" ]; then
+        kerberos_change_password "$USERNAME" && ok "mot de passe Kerberos changé" \
+            || die "échec du changement de mot de passe Kerberos"
+    elif [ "${DRY_RUN:-0}" = "1" ]; then
+        echo "${C_YELLOW}[dry-run]${C_RESET} ${KRB5_ADMIN_CMD} -q \"cpw ${USERNAME}\""
+    else
+        # Le mot de passe est envoyé sur l'entrée standard de kadmin plutôt
+        # qu'avec 'cpw -pw', qui le rendrait visible dans la sortie de ps.
+        out=$(printf '%s\n%s\n' "$NEW_PASSWORD" "$NEW_PASSWORD" | kadmin_run "cpw ${USERNAME}")
+        if echo "$out" | grep -q "changed"; then
+            ok "mot de passe Kerberos changé"
+        else
+            echo "$out" | grep -v "^Authenticating" >&2
+            die "échec du changement de mot de passe Kerberos"
+        fi
+    fi
+fi
+
+if [ "$do_ldap" = "1" ]; then
+    PWFILE=$(mktemp_tracked)
+    printf '%s' "$NEW_PASSWORD" > "$PWFILE"
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        echo "${C_YELLOW}[dry-run]${C_RESET} ldappasswd ${USER_DN}"
+    else
+        ldap_run ldappasswd -T "$PWFILE" "$USER_DN" >/dev/null \
+            && ok "mot de passe de l'annuaire changé" \
+            || die "échec de ldappasswd"
+    fi
+fi
+
+flush_cache
+run_hook HOOK_POST_PASSWD
+
+section "Terminé"
+[ "$GENERATED" = "1" ] && kv "Mot de passe" "$NEW_PASSWORD"
+[ "$do_krb5" = "1" ] && info "L'utilisateur doit relancer 'kinit ${USERNAME}'."
+exit 0

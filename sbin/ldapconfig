@@ -1,0 +1,298 @@
+#!/bin/bash
+# ldapconfig - Inspecte, teste et initialise la configuration de ldap-scripts.
+
+set -euo pipefail
+
+# --- Localisation de la bibliothèque partagée ------------------------------
+: "${LDAP_SCRIPTS_LIB:=@LIBDIR@}"
+case "$LDAP_SCRIPTS_LIB" in @*@) LDAP_SCRIPTS_LIB="" ;; esac
+if [ -z "$LDAP_SCRIPTS_LIB" ] || [ ! -f "$LDAP_SCRIPTS_LIB/runtime.sh" ]; then
+    _self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+    LDAP_SCRIPTS_LIB="$(cd "$(dirname "$_self")/../lib" && pwd)"
+fi
+[ -f "$LDAP_SCRIPTS_LIB/runtime.sh" ] || {
+    echo "ldap-scripts: runtime.sh introuvable, définis LDAP_SCRIPTS_LIB" >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$LDAP_SCRIPTS_LIB/runtime.sh"
+
+usage() {
+    cat <<'USAGE'
+ldapconfig - Configuration de ldap-scripts
+
+Usage :
+  ldapconfig <commande> [options]
+
+Commandes :
+  show [motif]     Affiche la configuration effective (paramètre, valeur,
+                   origine). Un motif filtre les noms : ldapconfig show KRB5
+  check            Teste la configuration : connexion, branches, droits,
+                   outils externes, templates
+  init [fichier]   Crée un fichier de configuration commenté, en posant
+                   quelques questions
+  files            Liste les fichiers de configuration pris en compte
+  params           Liste tous les paramètres disponibles et leur défaut
+  edit             Ouvre la configuration du site dans $EDITOR
+
+Exemples :
+  ldapconfig check
+  ldapconfig show HOME
+  ldapconfig init /etc/ldap-scripts/ldap-scripts.conf
+  ldapconfig show -o BASE_DN=dc=test,dc=lan
+
+USAGE
+    common_options_help
+}
+
+# 'init' et 'params' doivent fonctionner sans configuration valide : on les
+# traite avant le chargement complet.
+case "${1:-}" in
+    params)
+        printf '%s%s %s%s\n' "$C_BLUE" "$(pad "PARAMÈTRE" 32)" "VALEUR PAR DÉFAUT" "$C_RESET"
+        grep -E '^[A-Z_][A-Z0-9_]*=' "${LDAP_SCRIPTS_LIB}/defaults.sh" \
+            | while IFS='=' read -r name value; do
+                printf '%-32s %s\n' "$name" "${value//\"/}"
+            done
+        exit 0
+        ;;
+    init)
+        shift
+        TARGET="${1:-}"
+        if [ -z "$TARGET" ]; then
+            sysconf="${LDAP_SCRIPTS_SYSCONFDIR:-@SYSCONFDIR@}"
+            case "$sysconf" in @*@) sysconf="$(cd "${LDAP_SCRIPTS_LIB}/../etc" && pwd)" ;; esac
+            TARGET="${sysconf}/ldap-scripts.conf"
+        fi
+        setup_colors
+        if [ -e "$TARGET" ]; then
+            echo "Le fichier ${TARGET} existe déjà."
+            read -rp "L'écraser ? [o/N] " a
+            case "$a" in o|O|y|Y) ;; *) echo "Annulé."; exit 0 ;; esac
+        fi
+        echo "Quelques questions pour amorcer la configuration."
+        echo "(Entrée = valeur proposée entre crochets)"
+        echo
+        read -rp "Base de l'annuaire          [dc=example,dc=com] : " q_base
+        q_base="${q_base:-dc=example,dc=com}"
+        read -rp "URI du serveur              [ldap://localhost] : " q_uri
+        q_uri="${q_uri:-ldap://localhost}"
+        read -rp "DN de connexion             [cn=admin,${q_base}] : " q_bind
+        q_bind="${q_bind:-cn=admin,${q_base}}"
+        read -rp "Utiliser Kerberos ?         [o/N] : " q_krb
+        case "$q_krb" in o|O|y|Y) q_krb=1 ;; *) q_krb=0 ;; esac
+        read -rp "Gérer les répertoires ?     [O/n] : " q_home
+        case "$q_home" in n|N) q_home=0 ;; *) q_home=1 ;; esac
+        q_home_root="/home"
+        if [ "$q_home" = "1" ]; then
+            read -rp "Racine des répertoires      [/home] : " q_home_root
+            q_home_root="${q_home_root:-/home}"
+        fi
+        if [ "$q_krb" = "1" ]; then
+            q_pwmode="sasl"
+        else
+            q_pwmode="hash"
+        fi
+
+        mkdir -p "$(dirname "$TARGET")"
+        cat > "$TARGET" <<EOF
+########################################################################
+# ldap-scripts.conf - généré par 'ldapconfig init' le $(date +%F)
+#
+# Seuls les paramètres modifiés figurent ici ; tous les autres gardent
+# leur valeur par défaut (voir 'ldapconfig params' et CONFIGURATION.md).
+########################################################################
+
+# --- Annuaire ---------------------------------------------------------
+BASE_DN="${q_base}"
+LDAP_URI="${q_uri}"
+BIND_DN="${q_bind}"
+LDAP_AUTH="prompt"          # prompt | password | file | env | sasl | none
+LDAP_TLS="none"             # none | starttls | ldaps
+
+# --- Comptes ----------------------------------------------------------
+UID_MIN=10000
+DEFAULT_SHELL="/bin/bash"
+GROUP_MODE="per-user"       # per-user | shared | none
+USER_PASSWORD_MODE="${q_pwmode}"   # sasl | hash | none
+
+# --- Kerberos ---------------------------------------------------------
+KRB5_ENABLED=${q_krb}
+
+# --- Répertoires personnels -------------------------------------------
+HOME_ENABLED=${q_home}
+HOME_ROOT="${q_home_root}"
+#HOME_LOGICAL_ROOT="${q_home_root}"   # si le chemin diffère côté client
+
+# --- Suppression ------------------------------------------------------
+DELETE_HOME_ACTION="archive"   # archive | purge | keep
+ARCHIVE_DIR="/var/backups/ldap-scripts"
+EOF
+        chmod 640 "$TARGET"
+        ok "configuration écrite dans ${TARGET}"
+        info "Vérifie-la avec : ldapconfig check"
+        exit 0
+        ;;
+esac
+
+COMMAND="${1:-show}"
+[ $# -gt 0 ] && shift
+case "$COMMAND" in
+    show|check|files|edit) ;;
+    -h|--help|help) usage; exit 0 ;;
+    *) die "commande inconnue : '${COMMAND}' (voir --help)" ;;
+esac
+
+ldap_scripts_init "$@"
+set -- "${ARGS[@]:-}"
+
+case "$COMMAND" in
+
+files)
+    section "Fichiers de configuration"
+    if [ ${#CONFIG_FILES_LOADED[@]} -eq 0 ]; then
+        status warn "aucun fichier chargé, seuls les défauts s'appliquent"
+    else
+        for f in "${CONFIG_FILES_LOADED[@]}"; do
+            kv "chargé" "$f"
+        done
+    fi
+    kv "Défauts" "${LDAP_SCRIPTS_LIB}/defaults.sh"
+    kv "Répertoire système" "${LDAP_SCRIPTS_SYSCONFDIR:-<non défini>}"
+    kv "Templates" "$TEMPLATE_DIR"
+    echo
+    ;;
+
+edit)
+    target="${CONFIG_FILES_LOADED[0]:-${LDAP_SCRIPTS_SYSCONFDIR}/ldap-scripts.conf}"
+    [ -f "$target" ] || die "aucune configuration à éditer (lance 'ldapconfig init')"
+    exec "${EDITOR:-vi}" "$target"
+    ;;
+
+show)
+    pattern="${1:-}"
+    section "Configuration effective"
+    printf '  %s %s %s\n' "$(pad "PARAMÈTRE" 28)" "$(pad "VALEUR" 26)" "DÉFINI PAR"
+    while read -r name; do
+        [ -n "$name" ] || continue
+        if [ -n "$pattern" ] && [[ "$name" != *"$pattern"* ]]; then
+            continue
+        fi
+        value="${!name-}"
+        case "$name" in
+            LDAP_BIND_PASSWORD) [ -n "$value" ] && value="<défini>" ;;
+        esac
+        printf '  %s %s %s\n' "$(pad "$name" 28)" "$(pad "$value" 26)" \
+            "${CONFIG_ORIGIN[$name]:-défaut}"
+    done < <(config_known_vars)
+    echo
+    if [ -n "$pattern" ]; then
+        info "Filtre appliqué : '${pattern}'. Sans filtre, tout est affiché."
+    fi
+    ;;
+
+check)
+    failures=0
+    warnings=0
+
+    section "Configuration"
+    if [ ${#CONFIG_FILES_LOADED[@]} -eq 0 ]; then
+        status warn "aucun fichier de configuration chargé"
+        warnings=$((warnings + 1))
+    else
+        for f in "${CONFIG_FILES_LOADED[@]}"; do status ok "$f"; done
+    fi
+    kv "Base"        "$BASE_DN"
+    kv "Utilisateurs" "$USERS_DN"
+    kv "Groupes"     "$GROUPS_DN"
+    kv "Serveur"     "${LDAP_URI} (TLS: ${LDAP_TLS}, auth: ${LDAP_AUTH})"
+
+    section "Outils externes"
+    for tool in ldapsearch ldapadd ldapmodify ldapdelete ldappasswd; do
+        if command -v "$tool" >/dev/null 2>&1; then
+            status ok "$tool"
+        else
+            status ko "$tool absent (paquet ldap-utils / openldap-clients)"
+            failures=$((failures + 1))
+        fi
+    done
+    if [ "$USER_PASSWORD_MODE" = "hash" ]; then
+        command -v "$SLAPPASSWD_CMD" >/dev/null 2>&1 \
+            && status ok "$SLAPPASSWD_CMD" \
+            || { status ko "$SLAPPASSWD_CMD absent (nécessaire pour USER_PASSWORD_MODE=hash)"; failures=$((failures + 1)); }
+    fi
+    if krb5_enabled; then
+        command -v "${KRB5_ADMIN_CMD%% *}" >/dev/null 2>&1 \
+            && status ok "${KRB5_ADMIN_CMD} (realm ${KRB5_REALM})" \
+            || { status ko "${KRB5_ADMIN_CMD} introuvable"; failures=$((failures + 1)); }
+    else
+        status ok "Kerberos désactivé"
+        if [ "$USER_PASSWORD_MODE" = "sasl" ]; then
+            status warn "USER_PASSWORD_MODE=sasl sans Kerberos : les comptes créés n'auraient aucun mot de passe utilisable"
+            warnings=$((warnings + 1))
+        fi
+    fi
+
+    section "Templates"
+    for t in "$TEMPLATE_USER" "$TEMPLATE_GROUP"; do
+        if [ -f "$t" ]; then
+            status ok "$t"
+        else
+            status ko "$t introuvable"
+            failures=$((failures + 1))
+        fi
+    done
+
+    section "Connexion à l'annuaire"
+    if ldap_check_connection; then
+        status ok "bind réussi sur ${BASE_DN}"
+        for branch in "$USERS_DN" "$GROUPS_DN"; do
+            if ldap_run ldapsearch -LLL -b "$branch" -s base dn >/dev/null 2>&1; then
+                status ok "branche $branch"
+            else
+                status ko "branche $branch absente ou inaccessible"
+                failures=$((failures + 1))
+            fi
+        done
+        count=$(ldap_list_uidnumbers | grep -c . || true)
+        kv "Comptes existants" "$count"
+        if [ "$count" -gt 0 ]; then
+            kv "Prochain UID" "$(next_uid)"
+        else
+            kv "Prochain UID" "$UID_MIN (annuaire vide)"
+        fi
+    else
+        status ko "connexion impossible sur ${LDAP_URI}"
+        info "Vérifie LDAP_URI, BIND_DN, le mot de passe et LDAP_TLS."
+        failures=$((failures + 1))
+    fi
+
+    if home_enabled; then
+        section "Répertoires personnels"
+        if [ -d "$HOME_ROOT" ]; then
+            status ok "${HOME_ROOT} existe"
+        else
+            status warn "${HOME_ROOT} n'existe pas encore"
+            warnings=$((warnings + 1))
+        fi
+        [ "$HOME_ROOT" != "$HOME_LOGICAL_ROOT" ] && kv "Vu côté client" "$HOME_LOGICAL_ROOT"
+        if [ "$DELETE_HOME_ACTION" = "archive" ] && [ ! -d "$ARCHIVE_DIR" ]; then
+            status warn "${ARCHIVE_DIR} sera créé à la première suppression"
+            warnings=$((warnings + 1))
+        fi
+        if [ "$(id -u)" -ne 0 ]; then
+            status warn "tu n'es pas root : la gestion des répertoires échouera"
+            warnings=$((warnings + 1))
+        fi
+    fi
+
+    section "Résultat"
+    if [ "$failures" -eq 0 ] && [ "$warnings" -eq 0 ]; then
+        ok "configuration utilisable"
+    elif [ "$failures" -eq 0 ]; then
+        printf '  %s%s avertissement(s)%s, aucune erreur bloquante.\n' "$C_YELLOW" "$warnings" "$C_RESET"
+    else
+        printf '  %s%s erreur(s)%s et %s avertissement(s).\n' "$C_RED" "$failures" "$C_RESET" "$warnings"
+    fi
+    echo
+    [ "$failures" -eq 0 ] || exit 1
+    ;;
+esac

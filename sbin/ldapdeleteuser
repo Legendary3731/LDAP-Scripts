@@ -1,0 +1,145 @@
+#!/bin/bash
+# ldapdeleteuser - Supprime un compte : entrée LDAP, groupe associé,
+#                  principal Kerberos, et archive son répertoire personnel.
+
+set -euo pipefail
+
+# --- Localisation de la bibliothèque partagée ------------------------------
+: "${LDAP_SCRIPTS_LIB:=@LIBDIR@}"
+case "$LDAP_SCRIPTS_LIB" in @*@) LDAP_SCRIPTS_LIB="" ;; esac
+if [ -z "$LDAP_SCRIPTS_LIB" ] || [ ! -f "$LDAP_SCRIPTS_LIB/runtime.sh" ]; then
+    _self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+    LDAP_SCRIPTS_LIB="$(cd "$(dirname "$_self")/../lib" && pwd)"
+fi
+[ -f "$LDAP_SCRIPTS_LIB/runtime.sh" ] || {
+    echo "ldap-scripts: runtime.sh introuvable, définis LDAP_SCRIPTS_LIB" >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$LDAP_SCRIPTS_LIB/runtime.sh"
+
+usage() {
+    cat <<'USAGE'
+ldapdeleteuser - Supprime un compte utilisateur
+
+Usage :
+  ldapdeleteuser [options] <login> [login...]
+
+Description :
+  Supprime l'entrée LDAP, le groupe primaire si GROUP_MODE=per-user, le
+  principal Kerberos, puis traite le répertoire personnel selon
+  DELETE_HOME_ACTION (archive par défaut : rien n'est détruit).
+
+Options spécifiques :
+      --archive-home     Archive le répertoire (défaut)
+      --purge-home       Supprime définitivement le répertoire
+      --keep-home        Laisse le répertoire en place
+      --keep-kerberos    Conserve le principal Kerberos
+
+Exemples :
+  ldapdeleteuser jdupont
+  ldapdeleteuser --purge-home --yes stagiaire1 stagiaire2
+  ldapdeleteuser --dry-run jdupont
+
+USAGE
+    common_options_help
+}
+
+handle_extra_arg() {
+    case "$1" in
+        --archive-home)  CLI_OVERRIDES+=("DELETE_HOME_ACTION=archive"); EXTRA_SHIFT=1 ;;
+        --purge-home)    CLI_OVERRIDES+=("DELETE_HOME_ACTION=purge"); EXTRA_SHIFT=1 ;;
+        --keep-home)     CLI_OVERRIDES+=("DELETE_HOME_ACTION=keep"); EXTRA_SHIFT=1 ;;
+        --keep-kerberos) CLI_OVERRIDES+=("KEEP_KERBEROS=1"); EXTRA_SHIFT=1 ;;
+    esac
+}
+
+ldap_scripts_init "$@"
+set -- "${ARGS[@]:-}"
+
+[ $# -ge 1 ] && [ -n "${1:-}" ] || { usage; exit 1; }
+require_root
+LS_ACTION="delete"
+
+delete_one() {
+    USERNAME="$1"
+    USER_DN="$(ldap_user_dn "$USERNAME")"
+    GROUP_NAME="$USERNAME"
+    GROUP_DN="$(ldap_group_dn "$GROUP_NAME")"
+    HOME_PHYSICAL="$(home_physical)"
+
+    if ! ldap_user_exists "$USERNAME"; then
+        warn "le compte '${USERNAME}' n'existe pas dans l'annuaire, ignoré"
+        return 0
+    fi
+
+    section "Compte à supprimer"
+    kv "Login" "$USERNAME"
+    kv "DN"    "$USER_DN"
+    home_enabled && [ -d "$HOME_PHYSICAL" ] && kv "Répertoire" "${HOME_PHYSICAL} (${DELETE_HOME_ACTION})"
+    krb5_enabled && [ "${KEEP_KERBEROS:-0}" != "1" ] && kv "Kerberos" "${USERNAME}@${KRB5_REALM} (révoqué)"
+
+    if [ "${DELETE_CONFIRM:-1}" = "1" ]; then
+        confirm $'\n'"Confirmer la suppression de '${USERNAME}' ?" || { echo "Annulé."; return 0; }
+    fi
+
+    run_hook HOOK_PRE_DELETE
+
+    section "Suppression"
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        echo "${C_YELLOW}[dry-run]${C_RESET} ldapdelete ${USER_DN}"
+    elif ldap_run ldapdelete "$USER_DN" >/dev/null 2>&1; then
+        ok "entrée LDAP supprimée"
+    else
+        warn "échec de la suppression de ${USER_DN}"
+    fi
+
+    case "$GROUP_MODE" in
+        per-user)
+            if [ "${DRY_RUN:-0}" = "1" ]; then
+                echo "${C_YELLOW}[dry-run]${C_RESET} ldapdelete ${GROUP_DN}"
+            elif ldap_group_exists "$GROUP_NAME"; then
+                ldap_run ldapdelete "$GROUP_DN" >/dev/null 2>&1 \
+                    && ok "groupe ${GROUP_NAME} supprimé" \
+                    || warn "échec de la suppression du groupe ${GROUP_NAME}"
+            fi
+            ;;
+        shared)
+            if [ "$GROUP_ADD_MEMBER" = "1" ]; then
+                MODIFY_FILE=$(mktemp_tracked)
+                cat > "$MODIFY_FILE" <<EOF
+dn: $(ldap_group_dn "$DEFAULT_GROUP")
+changetype: modify
+delete: ${GROUP_MEMBER_ATTR}
+${GROUP_MEMBER_ATTR}: ${USERNAME}
+EOF
+                if [ "${DRY_RUN:-0}" = "1" ]; then
+                    echo "${C_YELLOW}[dry-run]${C_RESET} retrait de ${USERNAME} du groupe ${DEFAULT_GROUP}"
+                else
+                    ldap_run ldapmodify -f "$MODIFY_FILE" >/dev/null 2>&1 \
+                        && ok "retiré du groupe ${DEFAULT_GROUP}" || true
+                fi
+            fi
+            ;;
+    esac
+
+    if krb5_enabled && [ "${KEEP_KERBEROS:-0}" != "1" ]; then
+        if kerberos_principal_exists "$USERNAME" || [ "${DRY_RUN:-0}" = "1" ]; then
+            kerberos_delete_principal "$USERNAME"
+            ok "principal Kerberos révoqué"
+        fi
+    fi
+
+    if home_enabled; then
+        home_remove_or_archive "$HOME_PHYSICAL" "$DELETE_HOME_ACTION"
+    fi
+
+    flush_cache
+    run_hook HOOK_POST_DELETE
+    ok "compte ${USERNAME} supprimé"
+}
+
+log "Vérification de l'annuaire"
+ldap_check_connection || die "connexion LDAP impossible sur ${LDAP_URI} (teste avec 'ldapconfig check')"
+
+for account in "$@"; do
+    delete_one "$account"
+done

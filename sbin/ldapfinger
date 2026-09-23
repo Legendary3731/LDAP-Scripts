@@ -1,0 +1,167 @@
+#!/bin/bash
+# ldapfinger - Vue d'ensemble d'un compte : annuaire, Kerberos, NSS, home.
+
+set -euo pipefail
+
+# --- Localisation de la bibliothèque partagée ------------------------------
+: "${LDAP_SCRIPTS_LIB:=@LIBDIR@}"
+case "$LDAP_SCRIPTS_LIB" in @*@) LDAP_SCRIPTS_LIB="" ;; esac
+if [ -z "$LDAP_SCRIPTS_LIB" ] || [ ! -f "$LDAP_SCRIPTS_LIB/runtime.sh" ]; then
+    _self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+    LDAP_SCRIPTS_LIB="$(cd "$(dirname "$_self")/../lib" && pwd)"
+fi
+[ -f "$LDAP_SCRIPTS_LIB/runtime.sh" ] || {
+    echo "ldap-scripts: runtime.sh introuvable, définis LDAP_SCRIPTS_LIB" >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$LDAP_SCRIPTS_LIB/runtime.sh"
+
+usage() {
+    cat <<'USAGE'
+ldapfinger - Affiche l'état complet d'un compte
+
+Usage :
+  ldapfinger [options] <login>
+
+Description :
+  Rassemble sur un seul écran ce qui est habituellement éparpillé entre
+  ldapsearch, kadmin, getent et ls : entrée d'annuaire, principal Kerberos,
+  résolution NSS, groupes et répertoire personnel, avec un diagnostic de
+  cohérence entre ces sources.
+
+Options spécifiques :
+      --ldif             Affiche l'entrée LDAP brute, au format LDIF
+      --attrs "a b c"    Attributs à afficher (défaut : FINGER_ATTRS)
+      --all-attrs        Affiche tous les attributs de l'entrée
+
+Exemples :
+  ldapfinger jdupont
+  ldapfinger --ldif jdupont
+  ldapfinger --attrs "cn mail telephoneNumber" jdupont
+
+USAGE
+    common_options_help
+}
+
+handle_extra_arg() {
+    case "$1" in
+        --ldif)       CLI_OVERRIDES+=("OUTPUT_LDIF=1"); EXTRA_SHIFT=1 ;;
+        --attrs)      CLI_OVERRIDES+=("FINGER_ATTRS=$2"); EXTRA_SHIFT=2 ;;
+        --all-attrs)  CLI_OVERRIDES+=("FINGER_ATTRS="); EXTRA_SHIFT=1 ;;
+    esac
+}
+
+ldap_scripts_init "$@"
+set -- "${ARGS[@]:-}"
+
+[ $# -ge 1 ] && [ -n "${1:-}" ] || { usage; exit 1; }
+
+USERNAME="$1"
+USER_DN="$(ldap_user_dn "$USERNAME")"
+
+# --- Annuaire --------------------------------------------------------------
+# shellcheck disable=SC2086
+ENTRY=$(ldap_run ldapsearch -LLL -b "$USERS_DN" \
+    "(&${USER_FILTER}(${UID_ATTR}=${USERNAME}))" ${FINGER_ATTRS:-} 2>/dev/null || true)
+
+if [ "${OUTPUT_LDIF:-0}" = "1" ]; then
+    if [ -z "$ENTRY" ]; then
+        die "aucune entrée pour '${USERNAME}' dans ${USERS_DN}"
+    fi
+    printf '%s\n' "$ENTRY"
+    exit 0
+fi
+
+attr() {
+    printf '%s\n' "$ENTRY" \
+        | awk -v a="$1:" '$1 == a { $1=""; sub(/^[ \t]+/, ""); print; exit }'
+}
+
+section "Annuaire"
+if [ -z "$ENTRY" ]; then
+    status ko "aucune entrée pour '${USERNAME}' dans ${USERS_DN}"
+else
+    kv "DN" "$(printf '%s\n' "$ENTRY" | awk '/^dn:/ {sub(/^dn: /, ""); print; exit}')"
+    LDAP_UID="$(attr uidNumber)"
+    LDAP_GID="$(attr gidNumber)"
+    LDAP_HOME="$(attr homeDirectory)"
+    printf '%s\n' "$ENTRY" | grep -v '^dn:' | grep -v '^$' | while IFS=': ' read -r name value; do
+        kv "$name" "$value"
+    done
+fi
+
+# --- Kerberos --------------------------------------------------------------
+if krb5_enabled; then
+    section "Kerberos (${KRB5_REALM})"
+    KRB_OUT=$(kadmin_run "getprinc ${USERNAME}" | grep -v "^Authenticating" || true)
+    if printf '%s\n' "$KRB_OUT" | grep -q "^Principal: "; then
+        printf '%s\n' "$KRB_OUT" \
+            | grep -E "^(Principal|Expiration date|Last password change|Password expiration date|Maximum ticket life|Policy):" \
+            | while IFS=': ' read -r name value; do kv "$name" "$value"; done
+    else
+        status ko "aucun principal ${USERNAME}@${KRB5_REALM}"
+    fi
+fi
+
+# --- Résolution système ----------------------------------------------------
+section "Résolution système (NSS)"
+if NSS_LINE=$(getent passwd "$USERNAME" 2>/dev/null); then
+    kv "passwd" "$NSS_LINE"
+    NSS_UID=$(echo "$NSS_LINE" | cut -d: -f3)
+    GROUPS_LIST=$(id -nG "$USERNAME" 2>/dev/null || true)
+    [ -n "$GROUPS_LIST" ] && kv "Groupes" "$GROUPS_LIST"
+else
+    status warn "non résolu par NSS sur cette machine"
+    NSS_UID=""
+fi
+
+# --- Répertoire personnel --------------------------------------------------
+if home_enabled; then
+    section "Répertoire personnel"
+    HOME_PHYSICAL="$(home_physical)"
+    kv "Emplacement" "$HOME_PHYSICAL"
+    if [ -d "$HOME_PHYSICAL" ]; then
+        kv "Propriétaire" "$(stat -c '%U:%G (%u:%g)' "$HOME_PHYSICAL" 2>/dev/null || echo '?')"
+        kv "Permissions" "$(stat -c '%A' "$HOME_PHYSICAL" 2>/dev/null || echo '?')"
+        kv "Taille" "$(du -sh "$HOME_PHYSICAL" 2>/dev/null | cut -f1)"
+    else
+        status ko "répertoire absent"
+    fi
+fi
+
+# --- Diagnostic ------------------------------------------------------------
+section "Cohérence"
+problems=0
+if [ -n "$ENTRY" ]; then
+    status ok "présent dans l'annuaire"
+    if krb5_enabled; then
+        if kerberos_principal_exists "$USERNAME"; then
+            status ok "principal Kerberos présent"
+        else
+            status ko "principal Kerberos manquant : ${KRB5_ADMIN_CMD} -q \"addprinc ${USERNAME}\""
+            problems=$((problems + 1))
+        fi
+    fi
+    if home_enabled; then
+        if [ -d "$(home_physical)" ]; then
+            status ok "répertoire personnel présent"
+        else
+            status ko "répertoire personnel manquant"
+            problems=$((problems + 1))
+        fi
+    fi
+    if [ -n "${NSS_UID:-}" ] && [ -n "${LDAP_UID:-}" ] && [ "$NSS_UID" != "$LDAP_UID" ]; then
+        status warn "l'UID vu par NSS (${NSS_UID}) diffère de celui de l'annuaire (${LDAP_UID})"
+        problems=$((problems + 1))
+    fi
+    if [ -n "${LDAP_HOME:-}" ] && home_enabled && [ "$LDAP_HOME" != "$(home_logical)" ]; then
+        status warn "homeDirectory (${LDAP_HOME}) ne correspond pas à HOME_ROOT/HOME_PATTERN ($(home_logical))"
+        problems=$((problems + 1))
+    fi
+else
+    problems=$((problems + 1))
+fi
+if [ "$problems" -eq 0 ]; then
+    echo
+    ok "aucune incohérence détectée"
+fi
+echo

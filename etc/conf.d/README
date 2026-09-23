@@ -1,0 +1,15 @@
+Fragments de configuration.
+
+Tout fichier *.conf de ce répertoire est chargé après ldap-scripts.conf, dans
+l'ordre alphabétique, et peut redéfinir n'importe quel paramètre. Pratique
+pour séparer ce qui est propre à une machine (l'emplacement des répertoires
+personnels, par exemple) de la configuration commune, ou pour laisser un outil
+de déploiement déposer ses réglages sans toucher au fichier principal.
+
+Exemple, dans 10-nfs.conf :
+
+    HOME_ROOT="/srv/nfs4/home"
+    HOME_LOGICAL_ROOT="/home"
+
+La commande 'ldapconfig show' indique, pour chaque paramètre, le fichier d'où
+sa valeur provient.
