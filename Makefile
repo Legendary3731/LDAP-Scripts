@@ -65,12 +65,22 @@ install:
 
 install-completion:
 	$(INSTALL) -d $(DESTDIR)$(COMPDIR)
-	$(INSTALL) -m 644 share/bash-completion/ldap-scripts $(DESTDIR)$(COMPDIR)/$(PKGNAME)
-	@echo "  installé $(COMPDIR)/$(PKGNAME)"
+	@# bash-completion charge le fichier portant le nom de la commande tapée :
+	@# il en faut donc un par commande, le premier réel et les autres en liens.
+	@first=""; for s in $(SCRIPTS); do \
+		if [ -z "$$first" ]; then \
+			$(INSTALL) -m 644 share/bash-completion/ldap-scripts $(DESTDIR)$(COMPDIR)/$$s; \
+			first=$$s; \
+		else \
+			ln -sf $$first $(DESTDIR)$(COMPDIR)/$$s; \
+		fi; \
+		echo "  installé $(COMPDIR)/$$s"; \
+	done
 
 uninstall:
 	@for s in $(SCRIPTS); do rm -f $(DESTDIR)$(SBINDIR)/$$s; done
 	rm -f $(DESTDIR)$(LIBDIR)/runtime.sh $(DESTDIR)$(LIBDIR)/defaults.sh
+	@for s in $(SCRIPTS); do rm -f $(DESTDIR)$(COMPDIR)/$$s; done
 	rm -f $(DESTDIR)$(COMPDIR)/$(PKGNAME)
 	-rmdir $(DESTDIR)$(LIBDIR) 2>/dev/null || true
 	@echo "Désinstallé. $(SYSCONFDIR) a été conservé."

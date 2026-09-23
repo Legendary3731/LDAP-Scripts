@@ -40,20 +40,34 @@ d'une exécution.
 
 ## Installation
 
+À faire en root **sur la machine qui administre l'annuaire** : celle qui voit
+le serveur LDAP, et qui héberge le KDC et les répertoires personnels quand ces
+fonctions sont activées. Ce n'est pas un outil client ; le poste sur lequel tu
+édites ces fichiers n'a rien à installer.
+
 ```bash
-make install                      # /usr/local par défaut
+make install                      # PREFIX=/usr/local par défaut
+make install SYSCONFDIR=/etc/ldap-scripts    # config dans /etc (usuel sous Debian)
 make install PREFIX=/opt/ldap-scripts
 make install-completion           # complétion bash (facultatif)
 ldapconfig init                   # génère la configuration
 ldapconfig check                  # vérifie qu'elle est utilisable
 ```
 
-`make install` n'écrase jamais une configuration existante et injecte les
-chemins réels dans les scripts, qui n'ont donc besoin d'aucune variable
-d'environnement pour fonctionner.
+Les fichiers atterrissent dans `<PREFIX>/sbin`, `<PREFIX>/lib/ldap-scripts` et
+`<SYSCONFDIR>` (par défaut `<PREFIX>/etc/ldap-scripts`). `make install`
+n'écrase jamais une configuration existante et injecte les chemins réels dans
+les scripts, qui n'ont donc besoin d'aucune variable d'environnement pour
+fonctionner.
 
-Prérequis : `bash` 4+, les clients OpenLDAP (`ldapsearch`, `ldapadd`, …) et,
-selon la configuration, `slappasswd` et `kadmin.local`.
+Prérequis : `bash` 4.1+, `make`, les clients OpenLDAP (`ldapsearch`, `ldapadd`,
+…) et, selon la configuration, `slappasswd` et `kadmin.local`.
+
+Sans `make`, l'installation se résume à copier `sbin/`, `lib/` et `etc/` où tu
+veux : les scripts retrouvent la bibliothèque relativement à leur propre
+emplacement (`../lib/`), et `LDAP_SCRIPTS_CONF` désigne la configuration.
+Ils fonctionnent aussi directement depuis l'arborescence source, sans
+installation, ce qui est pratique pour tester.
 
 ## Configuration
 
